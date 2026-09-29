@@ -1055,17 +1055,63 @@ def list_quarantine(
 
 # ---------- retention: 安全归档压缩 ----------
 
+def verify_chain_rows(
+    rows: list[sqlite3.Row], *, start_seq: int, start_hash: str
+) -> Optional[dict[str, Any]]:
+    """按 /integrity 的同一规范, 从 (start_seq, start_hash)(链锚点或创世)起逐条
+    校验哈希链: 序号连续性、前后哈希衔接、记录内容哈希。
+
+    全部通过返回 None; 否则返回首个断点 {"seq", "event_id", "reason", "checked"},
+    reason 取值与 /integrity 完全一致(seq_gap / prev_hash_mismatch /
+    hash_mismatch), checked 为断点之前已通过校验的记录数。
+    """
+    prev_seq = start_seq
+    prev_hash = start_hash
+    checked = 0
+    for row in rows:
+        seq = row["id"]
+        # 序号连续性: 相邻记录 seq 必须逐一递增(首条须为起点 seq + 1)
+        if seq != prev_seq + 1:
+            return {"seq": seq, "event_id": row["event_id"], "reason": "seq_gap",
+                    "checked": checked}
+        # 前后哈希衔接: prev_hash 必须等于上一条记录的 hash(首条为起点哈希)
+        if row["prev_hash"] is None or row["prev_hash"] != prev_hash:
+            return {"seq": seq, "event_id": row["event_id"],
+                    "reason": "prev_hash_mismatch", "checked": checked}
+        # 事件字段: 按固定 JSON 规范重算哈希并与存储值比对
+        if row["hash"] is None or row["hash"] != record_hash(
+            seq=seq,
+            event_id=row["event_id"],
+            occurred_at=row["occurred_at"],
+            payload=json.loads(row["payload"]),
+            received_at=row["received_at"],
+            prev_hash=row["prev_hash"],
+        ):
+            return {"seq": seq, "event_id": row["event_id"],
+                    "reason": "hash_mismatch", "checked": checked}
+        checked += 1
+        prev_seq = seq
+        prev_hash = row["hash"]
+    return None
+
+
 @app.post("/retention/compact")
 def compact(req: CompactIn):
     """压缩归档 (当前锚点, cutoff_seq] 的连续事件前缀。
 
+    - 前缀完整性: 归档会物理删除前缀并把链锚点推进到末尾, 因此删除前从当前锚点
+      按 /integrity 的同一规范逐条核对拟删除事件的**序号连续性、前后哈希衔接与
+      内容哈希**。拟归档前缀内出现首个断点时, 实际归档与 dry_run 一律返回 **409**
+      及断点的 seq/event_id/reason(同 /integrity 取值), 事件、日计数视图与链
+      锚点全部保持原状——篡改不会因归档被"盖过去"而变成 verified=true。断点不在
+      拟归档前缀内(seq 晚于 cutoff)时不影响归档, 仍按既有连续边界归档。
     - 安全边界: cutoff_seq 不得超过所有已登记 consumer 的最小 cursor_seq;
       无 consumer 时以当前最大 seq 为边界。越界返回 409 并给出 safe_through_seq。
     - 执行时持久化最后一条被删记录的 seq/hash 作为链锚点, /integrity 从锚点继续校验。
     - 同一事务内按被删事件扣减所有日计数视图的对应日期计数(空桶移除)。
     - 只物理删除 events 中的事件内容; received_event_ids 中的 event_id 占用
       **刻意保留**, 故归档后同一 ID 重投仍判 duplicate(不分配新 seq、不重复投递)。
-    - dry_run=true 只返回预计删除数与边界, 不写库。
+    - dry_run=true 只返回预计删除数与边界, 不写库(但前缀校验照做, 检出断点同样 409)。
     - cutoff_seq 已被既往压缩覆盖时为幂等空操作, 不再校验安全边界。
     """
     with get_conn() as conn:
@@ -1108,20 +1154,35 @@ def compact(req: CompactIn):
                 },
             )
 
-        # 连续前缀: 从锚点后一条起逐条连续, 遇断档即止
+        # 拟归档前缀: 从锚点后一条起取到 cutoff_seq。删除前必须按 /integrity
+        # 规范逐条校验序号连续性/前后哈希衔接/内容哈希, 否则归档推进锚点会把
+        # 已被 /integrity 检出的篡改"盖过去"——首个断点直接 409, 不删不改。
         rows = conn.execute(
-            "SELECT id, occurred_at, payload, hash FROM events"
-            " WHERE id > ? AND id <= ? ORDER BY id",
+            "SELECT id, event_id, occurred_at, payload, received_at, prev_hash, hash"
+            " FROM events WHERE id > ? AND id <= ? ORDER BY id",
             (anchor_seq, req.cutoff_seq),
         ).fetchall()
-        prefix: list[sqlite3.Row] = []
-        expected = anchor_seq + 1
-        for r in rows:
-            if r["id"] != expected:
-                break
-            prefix.append(r)
-            expected += 1
+        break_info = verify_chain_rows(rows, start_seq=anchor_seq, start_hash=anchor_hash)
+        if break_info is not None:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "detail": "chain integrity break in compact prefix",
+                    "cutoff_seq": req.cutoff_seq,
+                    "safe_through_seq": safe_through_seq,
+                    "checked": break_info["checked"],
+                    "first_break": {
+                        "seq": break_info["seq"],
+                        "event_id": break_info["event_id"],
+                        "reason": break_info["reason"],
+                    },
+                },
+            )
 
+        # 全部通过后, 实际可删的连续前缀只到现存最后一条为止: 尾部缺号(请求
+        # cutoff_seq 落在现存事件之后, 但仍受安全边界约束)按既有边界截断;
+        # 前缀内不可能再有断档(上面已校验), 中间缺号会以 seq_gap 返回 409。
+        prefix = rows
         from_seq = anchor_seq + 1
         through_seq = prefix[-1]["id"] if prefix else anchor_seq
 
@@ -1184,7 +1245,8 @@ def integrity():
     """从链锚点开始校验哈希链: 序号连续性、前后哈希衔接、记录内容哈希。
 
     压缩归档后, 锚点(最后被删记录的 seq/hash)即校验起点; 全部事件已压缩时
-    没有待校验记录, 仍返回 verified=true。
+    没有待校验记录, 仍返回 verified=true。/retention/compact 归档前用同一套
+    校验(verify_chain_rows)核对拟删除前缀, 保证归档不会盖过已检出的断点。
     """
     with get_conn() as conn:
         anchor_seq, anchor_hash = get_chain_anchor(conn)
@@ -1194,34 +1256,16 @@ def integrity():
             (anchor_seq,),
         ).fetchall()
 
-    checked = 0
-    prev_seq = anchor_seq
-    prev_hash = anchor_hash
-    for row in rows:
-        seq = row["id"]
-        # 序号连续性: 相邻记录 seq 必须逐一递增(首条须为锚点 seq + 1)
-        if seq != prev_seq + 1:
-            return _chain_break(checked, seq, row["event_id"], "seq_gap")
-        # 前后哈希衔接: prev_hash 必须等于上一条记录的 hash(首条为锚点哈希)
-        if row["prev_hash"] is None or row["prev_hash"] != prev_hash:
-            return _chain_break(checked, seq, row["event_id"], "prev_hash_mismatch")
-        # 事件字段: 按固定 JSON 规范重算哈希并与存储值比对
-        if row["hash"] is None or row["hash"] != record_hash(
-            seq=seq,
-            event_id=row["event_id"],
-            occurred_at=row["occurred_at"],
-            payload=json.loads(row["payload"]),
-            received_at=row["received_at"],
-            prev_hash=row["prev_hash"],
-        ):
-            return _chain_break(checked, seq, row["event_id"], "hash_mismatch")
-        checked += 1
-        prev_seq = seq
-        prev_hash = row["hash"]
+    break_info = verify_chain_rows(rows, start_seq=anchor_seq, start_hash=anchor_hash)
+    if break_info is not None:
+        return _chain_break(
+            break_info["checked"], break_info["seq"],
+            break_info["event_id"], break_info["reason"],
+        )
 
     return {
         "verified": True,
-        "checked": checked,
+        "checked": len(rows),
         "first_break": None,
         "anchor_seq": anchor_seq,
     }
