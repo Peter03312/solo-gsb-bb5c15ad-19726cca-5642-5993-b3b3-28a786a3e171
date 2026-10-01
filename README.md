@@ -398,6 +398,25 @@ curl -X POST http://localhost:8000/retention/compact \
  "cutoff_seq": 1200, "safe_through_seq": 1000}
 ```
 
+**归档前缀完整性校验(防篡改被归档"洗白")**:归档删除前,会从**当前链锚点**起,按与 `/integrity` **完全相同**的哈希规范,对拟删除前缀 `(anchor_seq, cutoff_seq]` 逐条核对——**序号连续性**(首条须为 `anchor_seq + 1`,相邻逐一递增)、**前后哈希衔接**(`prev_hash` 等于上一条 `hash`,首条等于锚点哈希)、**事件内容哈希**(按固定 JSON 规范重算比对)。首个断点落在拟归档前缀内时,**`dry_run` 与实际执行都返回 409**,响应给出断点的 `seq`/`event_id`/`reason`(`reason` 取值沿用 `/integrity`:`seq_gap` / `prev_hash_mismatch` / `hash_mismatch`);此时**不删除任何事件、不扣减日计数视图、不推进链锚点**——事件、视图与锚点保持原状,篡改依旧能被 `/integrity` 检出:
+
+```bash
+# 假设 seq=2 的事件内容被存储层直接篡改, /integrity 本会报 hash_mismatch
+curl -s -X POST http://localhost:8000/retention/compact \
+  -H 'Content-Type: application/json' -d '{"cutoff_seq":3}'
+# 409
+```
+
+```json
+{"detail": "integrity check failed within archive prefix",
+ "cutoff_seq": 3,
+ "first_break": {"seq": 2, "event_id": "evt-2", "reason": "hash_mismatch"}}
+```
+
+- **断点不在拟归档前缀内时仍可按既有边界归档**:断点 `seq` 大于 `cutoff_seq`(例如断点在 seq=4、本次只归档到 3)时,该前缀校验通过、照常归档;锚点推进后 `/integrity` 从新锚点继续校验,该断点仍会被检出。归档后再把 `cutoff_seq` 扩到断点处仍会得到上面的 409。
+- **已覆盖区间保持幂等**:`cutoff_seq <= anchor_seq` 时不做前缀校验,直接返回 `noop`(实际执行)/`would_delete=0` 的 `dry_run`,即使锚点之后存在断点也不影响。
+- **无断点时响应不变**:`dry_run`、`compacted`/`noop` 成功响应的字段与成功后 `/integrity` 的约定均保持原样。
+
 **幂等**:`cutoff_seq` 落在既往压缩已覆盖的区间(≤ 当前 `anchor_seq`)时返回 `{"status":"noop","deleted":0,…}`,不重复删除、不改变锚点;`dry_run` 任何时候都不写库。全部事件被压缩后,新写入的事件会从锚点哈希继续接链,`/integrity` 仍返回 `verified=true`。
 
 **只删内容、不删 ID 占用**:归档删除的是 `events` 中的事件记录;首次接收时写入的 `event_id` 占用登记(`received_event_ids`)在同一事务中**刻意保留**。因此归档后同一 ID 重投不会"复活"为新事件——单条仍返回 200 `duplicate`,批量按序标 `duplicate`(`seq` 为 null),只有真正的新 ID 才续链接收(详见 1c 节)。日计数视图随被删事件扣减,重复投递不会把计数加回来。
@@ -678,7 +697,7 @@ curl -X PUT http://localhost:8000/relations/evt-c/parent \
 - **前缀确认**:`POST /consumers/{consumer_id}/ack-prefix` 与 `ack` 共用同一套租约校验,额外要求 `through_seq` 落在 `[lease_from_seq, lease_to_seq]`;在单个 `BEGIN IMMEDIATE` 事务内把游标推进到 `through_seq` 并清除租约,旧 token 立即作废,下次 `pull` 从 `through_seq+1` 重新租用。`through_seq` 等于批次末尾即整批确认;未知 consumer、过期/伪造/旧 token、序号越界均 409 且状态不变。
 - **游标回退**:`POST /consumers/{consumer_id}/rewind` 在单个 `BEGIN IMMEDIATE` 事务内完成"校验 consumer/租约/回退区间 `[anchor_seq, cursor_seq]` → 清除已过期租约 → 回退游标",与 `pull`/`ack`/`ack-prefix`/`compact` 串行,并发下只有单一结果。未过期租约、低于链锚点、向前推进、未知 consumer 均 409 且状态不变;回退后游标不低于链锚点,不会产生指向已压缩事件的租约。
 - **毒丸隔离**:`POST /consumers/{consumer_id}/quarantine` 在单个 `BEGIN IMMEDIATE` 事务内完成"核对令牌(与 `ack` 同套:无租约/过期/旧令牌 409)→ 核对租约起点与游标相邻(考虑链锚点)→ 复制首条事件完整内容、原哈希与非空原因到独立 `quarantined_events` 表 → 游标仅越过这一条并清除整批租约"。下次 `pull` 重新租用剩余事件并换发新 token,旧令牌立即作废;失败原因空白返回 422。`GET /consumers/{consumer_id}/quarantine` 分页查看隔离记录;副本独立于原事件存储,原事件被压缩归档(物理删除)后仍可查看。隔离会把游标推进过该事件,因此被隔离事件视为"已处理",可正常纳入安全归档,内容由隔离副本留存。
-- **安全归档压缩**:`POST /retention/compact` 在单个 `BEGIN IMMEDIATE` 事务内完成"读锚点 → 算安全边界(所有 consumer 的最小 `cursor_seq`,无 consumer 时为当前最大 seq)→ 校验 `cutoff_seq` → 删连续前缀 → 写链锚点"。越界 409 并返回 `safe_through_seq`;`dry_run` 只算不写;已覆盖区间幂等返回 `noop`。删除只作用于 `events` 内容与视图计数,**不触碰 `received_event_ids` 占用**,归档后重投同一 ID 仍是 duplicate(单条 200、批量按序 duplicate/seq null),占用信息随写入与归档在同一事务内保持一致。
+- **安全归档压缩**:`POST /retention/compact` 在单个 `BEGIN IMMEDIATE` 事务内完成"读锚点 → 算安全边界(所有 consumer 的最小 `cursor_seq`,无 consumer 时为当前最大 seq)→ 校验 `cutoff_seq` → **从当前锚点按与 `/integrity` 同一套规范逐条校验拟归档前缀**(序号连续、`prev_hash` 衔接、内容哈希)→ 删连续前缀 → 写链锚点"。前缀内首个断点(seq_gap/prev_hash_mismatch/hash_mismatch)让 dry_run 与实际执行都返回 **409** 并回传断点 `seq`/`event_id`/`reason`,事件、视图与锚点一律不动——修复了旧实现"只看序号连续就删除并推进锚点,把原本可检出的内容/哈希篡改洗白成 verified=true"的问题;断点不在拟归档前缀内(seq 更大)时前缀校验通过、照常按边界归档,锚点推进后断点继续被 `/integrity` 检出;`cutoff_seq <= anchor_seq` 不做前缀校验、幂等返回 `noop`/`would_delete=0`。越界 409 并返回 `safe_through_seq`;`dry_run` 只算不写;已覆盖区间幂等返回 `noop`。删除只作用于 `events` 内容与视图计数,**不触碰 `received_event_ids` 占用**,归档后重投同一 ID 仍是 duplicate(单条 200、批量按序 duplicate/seq null),占用信息随写入与归档在同一事务内保持一致。
 - **持久化快照导出**:`POST /exports` 在单个 `BEGIN IMMEDIATE` 事务内完成"读链锚点 → 写快照元数据(锚点 seq/hash、末尾 seq、总数)→ `INSERT ... SELECT` 整体复制当前全部未压缩事件到 `export_events`",与事件写入、压缩归档串行,副本与元数据来自同一时刻。副本落库后不可变:`GET /exports/{id}/events` 只查快照表,按 `(snapshot_id, seq)` 主键升序分页(多取一条判断 `next_after_seq`,末页为 `null`),后续写入/压缩/重启均不影响;`after_seq` 越出 `[anchor_seq, end_seq]` 返回 422。`DELETE /exports/{id}` 在同一事务内删除画像统计(`export_field_coverage` 及其路径表)、事件副本与元数据,未知或已删除统一 404。
 - **快照字段覆盖画像**:`GET /exports/{id}/field-coverage` 只读 `export_events` 副本(不读不写 events、不返回字段值),对每条 payload 用显式栈迭代递归(避免深层 JSON 触发递归上限),产出 (路径, JSON 类型) 集合:根路径 `""`、对象键把 `~`/`/`/`*` 转义为 `~0`/`~1`/`~2`、数组下标统一 `*`、空数组不产生元素路径。聚合时**出现按路径、类型按 (路径, 类型) 双重去重**——同一事件同路径只计一次、每种类型也只计一次,因此混合数组的类型数之和可超过出现数,`null` 计为出现,`missing = total - present`。**路径统计惰性持久化**:首次查询(含历史快照)在单个 `BEGIN IMMEDIATE` 事务内把副本全量扫描一次、聚合并把统计头(total/路径数)与每个路径的六类计数写入 `export_field_coverage` / `export_field_coverage_paths`(`WITHOUT ROWID`,`(snapshot_id, path)` 复合主键),同事务原子提交,无半成品;并发首次查询经写锁 + 持锁复查串行化,只计算一次、不重复写入,与删除快照互斥(等待期间快照被删则返回 404)。之后翻页仅按主键做 `path > cursor` 范围读取本页(查询计划为主键 SEARCH),延迟与事件数无关,重启后复用,且**绝不从当前 events 补算**;`POST /exports` 不预生成,空快照只落 `total=0` 统计头。分页只取严格大于 `after_path` 的项(缺省从根 `""` 起含根,显式空串游标则跳过根;末页 `next_after_path` 为 null)。空快照返回 `total=0` 空列表;未知/已删除 404,`limit` 越界或游标不是合法转义(非根不以 `/` 开头、裸 `~n`、键段内裸 `*`)422。`DELETE /exports/{id}` 同事务清理统计与副本。不改动既有 `/exports/{id}/events` 导出接口。
 - **事件日计数视图**:规则存 `count_views`(名称 `UNIQUE`,重名 409),日桶计数存 `count_view_buckets`(`(view_id, day)` 主键)。`POST /views` 在单个 `BEGIN IMMEDIATE` 事务内"保存规则 → 全量扫描现存事件按 UTC 日期回填";`/events` 与 `/events/batch` 只对真正新建的条目逐视图匹配增量 +1(重复 `event_id` 走幂等分支,不动视图);`/retention/compact` 在同一事务内对被删前缀逐条扣减并移除空桶——因此视图始终等于"当前 events 表内匹配事件按发生日期的计数",迟到事件按 `occurred_at` 归其发生日期。`GET /views/{name}` 按名称返回各日计数与总数,`DELETE /views/{name}` 单事务删除规则与日桶,未知名称均 404。
@@ -700,7 +719,7 @@ curl -X PUT http://localhost:8000/relations/evt-c/parent \
 | POST | `/consumers/{consumer_id}/rewind` | 游标回退到 `target_seq`(限 `[anchor_seq, cursor_seq]`),下次 `pull` 从 `target_seq+1` 重投;未过期租约/越界/未知 consumer 返回 409 |
 | POST | `/consumers/{consumer_id}/quarantine` | 隔离当前未过期租约的首条事件(带非空 `reason`):单事务核对令牌与租约相邻性、复制完整事件到独立隔离记录、游标越过一条并清除整批租约;无租约/过期/旧令牌/不相邻返回 409,原因为空返回 422 |
 | GET | `/consumers/{consumer_id}/quarantine` | 分页查询该 consumer 的隔离记录;携带原事件完整内容副本,原事件归档后仍可查看 |
-| POST | `/retention/compact` | 安全归档压缩连续事件前缀(`cutoff_seq`/`dry_run`):同事务删内容/扣视图/写链锚点但**保留 event_id 占用**,归档后重投仍判重;越界 409 并返回 `safe_through_seq` |
+| POST | `/retention/compact` | 安全归档压缩连续事件前缀(`cutoff_seq`/`dry_run`):删除前从当前锚点按 `/integrity` 同规范逐条校验拟归档前缀(序号/prev_hash/内容哈希),断点在前缀内时 dry_run 与实际执行均 409 并回传 `first_break`(seq/event_id/reason),事件/视图/锚点保持原状;断点在前缀外不影响按边界归档,已覆盖区间幂等;同事务删内容/扣视图/写链锚点但**保留 event_id 占用**,归档后重投仍判重;越界 409 并返回 `safe_through_seq` |
 | POST | `/exports` | 创建持久化快照:单事务复制全部未压缩事件与链锚点,返回快照 ID、锚点 seq/hash、末尾 seq 与总数 |
 | GET | `/exports/{id}/events` | 按原 `seq` 升序分页读取快照副本(`after_seq` 默认锚点序号,限 `[anchor_seq, end_seq]` 否则 422;`limit` 1~1000;`next_after_seq` 末页为 null) |
 | GET | `/exports/{id}/field-coverage` | 读取快照副本的字段覆盖画像(首次查询基于副本一次性聚合并**原子持久化**,之后按路径游标主键范围读页、重启复用,绝不从 events 补算;并发首次查询不重复/不半成品):按路径(根 `''`、键转义 `~0/~1/~2`、数组下标 `*`)统计出现/缺失事件数与各 JSON 类型事件数;`after_path` 字典序游标(严格大于,缺省含根)、`limit` 1~1000,`next_after_path` 末页为 null;只读副本不返回字段值;未知快照 404,非法游标/`limit` 422 |
